@@ -127,7 +127,7 @@ def get_image_path(folder, frame_index, side):
 def evaluate(opt):
     """Evaluates a pretrained model using a specified test set
     """
-    MN_DEPTHI = 1e-3
+    MIN_DEPTH = 1e-3
     MAX_DEPTH = 80
 
     K = np.array([[0.58, 0, 0.5, 0],
@@ -314,14 +314,20 @@ def evaluate(opt):
             ratio1,surface_normal1,ground_mask1,cam_points1 = scale_recovery(pred_depth)
             #ratio = ratio1.cpu().item()
             surface_normal = surface_normal1.cpu()[0,0,:,:].numpy()
-            ground_mask = ground_mask1.cpu()[0,0,:,:].numpy()fit.cpu().numpy()
+            ground_mask = ground_mask1.cpu()[0,0,:,:].numpy()
             pred_depth = pred_depth[0].cpu().numpy()
             cam_points=cam_points1.cpu().numpy()
-            cam_points_masked = cam_points[np.where(ground_mask==1)] 
-            print(cam_points_masked.shape)
-            plane,inliers = fit_plane_LSE_RANSAC(cam_points_masked.T)
-            print(plane)
-            ratio_rans = 1.65 / plane[-1]
+            cam_points2=cam_points.transpose(1,2,0)
+            cam_points_masked = cam_points2[np.where(ground_mask==1)]
+            np.random.shuffle(cam_points_masked) 
+            cam_points4 = np.array(cam_points_masked)
+            print(cam_points4.shape)
+            cam_points4 = cam_points4[:2000,:]
+            cam_points3 = np.concatenate((cam_points4, np.ones((cam_points4.shape[0], 1))), axis=1)
+            print(cam_points3.shape)
+            plane,inliers = fit_plane_LSE_RANSAC(cam_points3)
+            #print(plane)
+            ratio_rans = abs(1.65 / plane[-1])
         else:
             ratio = 1
         #print(ratio)
@@ -333,7 +339,7 @@ def evaluate(opt):
         pred_depth_ori = np.where(mask==1,pred_depth_ori,1)
         pred_depth = pred_depth[mask]
         gt_depth = gt_depth[mask]
-        mean_scale.append(np.mean(gt_depth/pred_depth))
+        #mean_scale.append(np.mean(gt_depth/pred_depth))
 
         '''
         error_try = 100
@@ -374,9 +380,9 @@ def evaluate(opt):
         blending_imgs(surface_normal,color,i,'surface_normals')
         blending_imgs(ground_mask,color,i,'ground_masks')
         '''
-        blending_imgs(ground_mask,color,i,mask)
-        pred_depth *= ratio
-        ratios.append(ratio)
+        blending_imgs(ground_mask,color,i,ground_mask)
+        pred_depth *= ratio_rans
+        ratios.append(ratio_rans)
 
         pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
         pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
@@ -389,7 +395,7 @@ def evaluate(opt):
     fl.writelines(str(ex_logs))
     fl.close()
     '''
-    np.save('mean_scale.npy', mean_scale)
+    #np.save('mean_scale.npy', mean_scale)
 
     ratios = np.array(ratios)
     med = np.median(ratios)

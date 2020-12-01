@@ -25,6 +25,10 @@ import datasets
 import networks
 from IPython import embed
 
+import cv2
+
+MIN_DEPTH = 1e-3
+MAX_DEPTH = 80
 
 class Trainer:
     def __init__(self, options):
@@ -120,6 +124,8 @@ class Trainer:
         print("Training is using:\n  ", self.device)
 
         # data
+        if self.opt.split == "odom":
+            self.opt.dataset = "kitti_odom"
         datasets_dict = {
             "kitti": datasets.KITTIRAWDataset,
             "kitti_odom": datasets.KITTIOdomDataset}
@@ -138,7 +144,7 @@ class Trainer:
             self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
             self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
         self.train_loader = DataLoader(
-            train_dataset, self.opt.batch_size, True,
+            train_dataset, self.opt.batch_size, False,
             num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
         val_dataset = self.dataset(
             self.opt.data_path, val_filenames, self.opt.height, self.opt.width,
@@ -149,7 +155,7 @@ class Trainer:
         self.val_iter = iter(self.val_loader)
 
         self.writers = {}
-        for mode in ["train", "val"]:
+        for mode in ["train", "val", "td"]:
             self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
 
         if not self.opt.no_ssim:
@@ -158,7 +164,6 @@ class Trainer:
 
         self.backproject_depth = {}
         self.project_3d = {}
-        ori_backprojects = []
         for scale in self.opt.scales:
             h = self.opt.height // (2 ** scale)
             w = self.opt.width // (2 ** scale)
@@ -205,7 +210,16 @@ class Trainer:
         """Run a single epoch of training and validation
         """
         print("Training")
+        for batch_idx, inputs in enumerate(self.train_loader):
+            if batch_idx == 0:
+                inputs1 = inputs.copy()
+                for key, ipt in inputs1.items():
+                    inputs1[key] = ipt.to(self.device)
+
+            else:
+                break
         self.set_train()
+         
 
         for batch_idx, inputs in enumerate(self.train_loader):
 
@@ -228,16 +242,14 @@ class Trainer:
 
                 if "depth_gt" in inputs:
                     self.compute_depth_losses(inputs, outputs, losses)
-                if batch_idx == 1:
-                    inputs1 = inputs
+
                 self.log("train", inputs, outputs, losses)
                 self.val()
-                features = self.models["encoder"](inputs1["color_aug", 0, 0])
-                outputs1 = self.models["depth"](features)
-                self.generate_images_pred(inputs1, outputs1)
-                losses1 = self.compute_losses(inputs1, outputs1)
-                outputs1.update(self.predict_poses(inputs1, features))
-                #self.log("td",inputs1,outputs1,losses1)
+            if batch_idx % 250 == 0:
+                outputs1,losses1 = self.process_batch(inputs1)
+                #self.generate_images_pred(inputs1, outputs1)
+                #losses1 = self.compute_losses(inputs1, outputs1)
+                self.log("td",inputs1,outputs1, None)
 
             self.step += 1
 
@@ -319,7 +331,7 @@ class Trainer:
                     [inputs[("color_aug", i, 0)] for i in self.opt.frame_ids if i != "s"], 1)
 
                 if self.opt.pose_model_type == "separate_resnet":
-                    pose_inputs = [self.mode7-ls["pose_encoder"](pose_inputs)]
+                    pose_inputs = [self.models["pose_encoder"](pose_inputs)]
 
             elif self.opt.pose_model_type == "shared":
                 pose_inputs = [features[i] for i in self.opt.frame_ids if i != "s"]
@@ -394,7 +406,6 @@ class Trainer:
                     cam_points, inputs[("K", source_scale)], T)
 
                 outputs[("sample", frame_id, scale)] = pix_coords
-                
 
                 outputs[("color", frame_id, scale)] = F.grid_sample(
                     inputs[("color", frame_id, source_scale)],
@@ -549,50 +560,66 @@ class Trainer:
         """Write an event to the tensorboard events file
         """
         writer = self.writers[mode]
-        for l, v in losses.items():
-            writer.add_scalar("{}".format(l), v, self.step)
-        divs = []
-        for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
-            for s in self.opt.scales:
-                for frame_id in self.opt.frame_ids:
-                    writer.add_image(
-                        "color_{}_{}/{}".format(frame_id, s, j),
-                        inputs[("color", frame_id, s)][j].data, self.step)
+        if losses != None:
+            for l, v in losses.items():
+                writer.add_scalar("{}".format(l), v, self.step)
 
-
-                    
-                    writer.add_image(
-                        "color_{}_{}/{}".format(frame_id, s, j),
-                        inputs[("color", frame_id, s)][j].data, self.step)
-                    if s == 0 and frame_id != 0:
+            for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
+                for s in self.opt.scales:
+                    for frame_id in self.opt.frame_ids:
                         writer.add_image(
-                            "color_pred_{}_{}/{}".format(frame_id, s, j),
-                            outputs[("color", frame_id, s)][j].data, self.step)
-
-                writer.add_image(
-                    "disp_{}/{}".format(s, j),
-                    normalize_image(outputs[("disp", s)][j]), self.step)
-
-                if self.opt.predictive_mask:
-                    for f_idx, frame_id in enumerate(self.opt.frame_ids[1:]):
+                            "color_{}_{}/{}".format(frame_id, s, j),
+                            inputs[("color", frame_id, s)][j].data, self.step)
                         writer.add_image(
-                            "predictive_mask_{}_{}/{}".format(frame_id, s, j),
-                            outputs["predictive_mask"][("disp", s)][j, f_idx][None, ...],
-                            self.step)
-
-                elif not self.opt.disable_automasking:
+                            "color_{}_{}/{}".format(frame_id, s, j),
+                            inputs[("color", frame_id, s)][j].data, self.step)
+                        if s == 0 and frame_id != 0:
+                                writer.add_image(
+                                "color_pred_{}_{}/{}".format(frame_id, s, j),
+                                outputs[("color", frame_id, s)][j].data, self.step)
                     writer.add_image(
-                        "automask_{}/{}".format(s, j),
-                        outputs["identity_selection/{}".format(s)][j][None, ...], self.step)
-                np.concatenate(divs)
+                        "disp_{}/{}".format(s, j),
+                        normalize_image(outputs[("disp", s)][j]), self.step)
+
+                    if self.opt.predictive_mask:
+                        for f_idx, frame_id in enumerate(self.opt.frame_ids[1:]):
+                            writer.add_image(
+                                "predictive_mask_{}_{}/{}".format(frame_id, s, j),
+                                outputs["predictive_mask"][("disp", s)][j, f_idx][None, ...],
+                                self.step)
+
+                    elif not self.opt.disable_automasking:
+                            writer.add_image(
+                            "automask_{}/{}".format(s, j),
+                            outputs["identity_selection/{}".format(s)][j][None, ...], self.step)
         if mode=="td":
-            depth = outputs[("depth", 0, 0)]
-            translation = outputs[("translation", 0, 1)]
-            div = torch.norm(translation)/torch.mean(depth)
-            writer.add_scalar("t/d",div, self.step)
-            
-
-            
+            for bb in range(1,self.opt.batch_size):
+                depth = outputs[("depth", 0, 0)][bb].squeeze(0).detach().cpu().numpy()
+                gt_depth = inputs["depth_gt"][bb].squeeze(0).cpu()
+                one = torch.ones(gt_depth.shape).cpu()
+                zero = torch.zeros(gt_depth.shape).cpu()
+                mask = torch.where((gt_depth > MIN_DEPTH)& (gt_depth < MAX_DEPTH),one,zero)
+                gt_height, gt_width = gt_depth.shape[:2]
+                crop = torch.Tensor(
+                [0.40810811 * gt_height, 0.99189189 * gt_height,
+                 0.03594771 * gt_width,  0.96405229 * gt_width]).int()
+                crop_mask = torch.zeros(mask.shape)
+                crop_mask[crop[0]:crop[1], crop[2]:crop[3]] = 1
+                mask_t = torch.where((mask==1)& (crop_mask==1),one,zero).int()
+                mask = mask_t.numpy()
+                depth_resized = cv2.resize(depth, (gt_width, gt_height))
+                depth_selected = depth_resized[mask]
+                d = torch.mean(depth_selected)
+                gt_depth = gt_depth[mask]
+                gt_d = torch.mean(gt_depth)
+                translation = outputs[("translation", 0, 1)][bb].squeeze(0)
+                print("shape of predicted translation",translation.shape)
+                gt_translation = inputs["gt_translation"][bb].squeeze(0)
+                div = torch.norm(translation)/d
+                writer.add_scalar("t/d_{}".format(bb),div, self.step)
+                writer.add_scalars("t_{}".format(bb),{"pred_t":torch.norm(translation),"gt_t":torch.norm(gt_translation)})         
+                writer.add_scalars("d_{}".format(bb),{"pred_d":d,"gt_d":gt_d})
+                print("file in batch1",inputs["file_name"][bb])         
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with
         """

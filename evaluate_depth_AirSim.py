@@ -19,8 +19,6 @@ import matplotlib.pyplot as plt
 from math import sqrt
 from scipy.stats import norm
 
-from fit_plane_LSE import fit_plane_LSE_RANSAC
-
 cv2.setNumThreads(0)  # This speeds up evaluation 5x on our unix systems (OpenCV 3.3.1)
 
 
@@ -77,9 +75,6 @@ def create_scatter(ratio_tmp,mask):
     values = ratio_tmp[mask==1]
     return x,y,values
 
-def create_scatter_p(mask):
-    x,y = np.where(mask==1)
-    return x,y
 
 def blending_imgs(ratio_tmp, input_img,i,mask):
     """visualizing the factors affecting scale
@@ -94,21 +89,12 @@ def blending_imgs(ratio_tmp, input_img,i,mask):
     plt.gca().yaxis.set_major_locator(plt.NullLocator())
     plt.subplots_adjust(top=1,bottom=0,left=0,right=1,hspace=0,wspace=0)
     plt.margins(0,0)
-    #x,y,values = create_scatter(ratio_tmp,mask)
-    x,y = create_scatter_p(mask)
+    x,y,values = create_scatter(ratio_tmp,mask)
     ax.imshow(input_img)
-    #ax.scatter(y,x,s=0.1,c=values,alpha=0.5,cmap='jet',vmin=-1,vmax=10)
-    ax.scatter(y,x,s=1,c='r',alpha=0.5)
-    #plt.savefig(os.path.join(os.path.dirname(__file__), "blend_imgs","{:010d}.png".format(i)))
-    plt.savefig(os.path.join(os.path.dirname(__file__), "ground_masks_kitti","{:010d}.png".format(i)))
-    #ax.imshow(ratio_tmp,cmap='plasma')
-    #plt.savefig('tmp.png')
-    #img_tmp = pil_loader('tmp.png')
-    #print(input_img.size,img_tmp.size)
-    #img_blend = Image.blend(input_img, img_tmp,0.5)
-    #img_blend.save(os.path.join(os.path.dirname(__file__), name,"{:006d}.png".format(i)))
+    ax.scatter(y,x,s=0.1,c=values,alpha=0.5,cmap='jet',vmin=-1,vmax=10)
+    plt.savefig(os.path.join(os.path.dirname(__file__), "blend_imgs_AirSim","{}.png".format(i)))
     plt.close()
-    #return img_blend
+    
 
 def tensor_to_PIL(tensor,idx):
     unloader = transforms.ToPILImage()
@@ -119,19 +105,19 @@ def tensor_to_PIL(tensor,idx):
     return image
 
 def get_image_path(folder, frame_index, side):
-        f_str = "{:010d}{}".format(frame_index, '.jpg')
+        f_str = "{}{}".format(frame_index, '.png')
         image_path = os.path.join(
-            '/mnt/sdb/xuefeng_data/kitti_data', folder, "image_0{}/data".format(side), f_str)
+            '/mnt/sdb/wzy_data/AirSim_data', "images", f_str)
         return image_path
 
 def evaluate(opt):
     """Evaluates a pretrained model using a specified test set
     """
-    MN_DEPTHI = 1e-3
+    MIN_DEPTH = 1e-3
     MAX_DEPTH = 80
 
-    K = np.array([[0.58, 0, 0.5, 0],
-                  [0, 1.92, 0.5, 0],
+    K = np.array([[0.5, 0, 0.5, 0],
+                  [0, 1.656, 0.5, 0],
                   [0, 0, 1, 0],
                   [0, 0, 0, 1]], dtype=np.float32)
 
@@ -153,7 +139,7 @@ def evaluate(opt):
 
         encoder_dict = torch.load(encoder_path)
 
-        dataset = datasets.KITTIRAWDataset(
+        dataset = datasets.AirSimDataset(
             opt.data_path, filenames,
             encoder_dict['height'], encoder_dict['width'],
             [0], 4, is_train=False)
@@ -174,6 +160,7 @@ def evaluate(opt):
         depth_decoder.eval()
 
         pred_disps = []
+        gt_depths = []
 
         print("-> Computing predictions with size {}x{}".format(
             encoder_dict['width'], encoder_dict['height']))
@@ -250,7 +237,6 @@ def evaluate(opt):
 
         print("-> No ground truth is available for the KITTI benchmark, so not evaluating. Done.")
         quit()
-
     gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
     gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1', allow_pickle=True)["data"]
 
@@ -266,6 +252,7 @@ def evaluate(opt):
 
     errors = []
     ratios = []
+    ratios_dgc = []
     ex_logs = []
     mean_scale = []
     side_map = {"2": 2, "3": 3, "l": 2, "r": 3}
@@ -279,18 +266,13 @@ def evaluate(opt):
         frame_index = line[1]
         side = side_map[line[2]]
         color = pil_loader(get_image_path(folder,int(frame_index),side))
-        #color = pil_loader('/mnt/sdb/xuefeng_data/dkit_dataset/20200629_mechanical_fast/images/{:006d}.png'.format(i))
-        #color = color.crop((0,191,640,383))
-        
-
         pred_disp = pred_disps[i]
         pred_disp = cv2.resize(pred_disp, (gt_width, gt_height))
-        pred_depth = 1 / pred_disp
-        
+        pred_depth = 1 / pred_disp     
 
-        if opt.eval_split == "eigen":
+        if (opt.eval_split == "eigen")|(opt.eval_split == "AirSim"):
             mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
-
+            '''
             crop = np.array(
                 [0.40810811 * gt_height, 0.99189189 * gt_height,
                  0.03594771 * gt_width,  0.96405229 * gt_width]).astype(np.int32)
@@ -299,29 +281,35 @@ def evaluate(opt):
             mask = np.logical_and(mask, crop_mask)
             if opt.eval_object:
                 object_mask = object_masks[i].astype(np.bool)
+            '''
 
         else:
             mask = gt_depth > 0
         
         if opt.scaling == "gt":
             ratio = np.median(gt_depth[mask]) / np.median(pred_depth[mask])
+            ratios.append(ratio)
             if opt.eval_object:
                 mask = np.logical_and(mask, object_mask)
-        elif opt.scaling == "dgc":
+        #elif opt.scaling == "dgc":
             scale_recovery = ScaleRecovery(1, gt_height, gt_width, K).cuda()
             #scale_recovery = ScaleRecovery(1, 192, 640, K).cuda()
             pred_depth = torch.from_numpy(pred_depth).unsqueeze(0).cuda()
-            ratio1,surface_normal1,ground_mask1,cam_points1 = scale_recovery(pred_depth)
-            #ratio = ratio1.cpu().item()
-            surface_normal = surface_normal1.cpu()[0,0,:,:].numpy()
-            ground_mask = ground_mask1.cpu()[0,0,:,:].numpy()fit.cpu().numpy()
+            ratio1 = scale_recovery(pred_depth)
+            ratio = ratio1.cpu().item()
+            ratios_dgc.append(ratio)
             pred_depth = pred_depth[0].cpu().numpy()
-            cam_points=cam_points1.cpu().numpy()
-            cam_points_masked = cam_points[np.where(ground_mask==1)] 
-            print(cam_points_masked.shape)
-            plane,inliers = fit_plane_LSE_RANSAC(cam_points_masked.T)
-            print(plane)
-            ratio_rans = 1.65 / plane[-1]
+            '''
+            surface_normal = surface_normal1.cpu()[0,:,:,:].numpy()
+            ground_mask = ground_mask1.cpu()[0,0,:,:].numpy()
+            pred_depth = pred_depth[0].cpu().numpy()
+            
+            if i==28:
+                np.save('pred_disp28.npy',pred_disp)
+                np.save('surface_normal28.npy',surface_normal)
+                np.save('ground_mask28.npy',ground_mask)
+                print(np.min(pred_depth),np.max(pred_depth),ratio)
+            '''
         else:
             ratio = 1
         #print(ratio)
@@ -334,8 +322,7 @@ def evaluate(opt):
         pred_depth = pred_depth[mask]
         gt_depth = gt_depth[mask]
         mean_scale.append(np.mean(gt_depth/pred_depth))
-
-        '''
+        
         error_try = 100
         scale_abs = 0 
         for ratio_try in np.arange(0.1,50,step=0.1):
@@ -345,53 +332,46 @@ def evaluate(opt):
             if error_tmp < error_try:
                 error_try = error_tmp
                 scale_abs = ratio_try
+        ex_logs.append(scale_abs)
         div_scale = gt_depth_ori / pred_depth_ori
         #print(div_scale.shape)
         div_values1 = div_scale[mask]
         div_scale = (div_scale-scale_abs)/scale_abs
         div_values = div_scale[mask]
-        div_rmse = sqrt(sum((div_values1-scale_abs)*(div_values1-scale_abs))/len(div_values1))
-        print(min(div_values),max(div_values))
-        ex_logs.append([i,min(div_values), max(div_values), div_rmse,scale_abs])
+        #div_rmse = sqrt(sum((div_values1-scale_abs)*(div_values1-scale_abs))/len(div_values1))
+        print("min,max value of div_values no abs is",min(div_values),max(div_values))
+        #ex_logs.append([i,min(div_values), max(div_values), div_rmse,scale_abs])
         #print(div_scale.shape)
         #div_scale = div_scale/np.max(div_scale)
+        
         mu = np.mean(div_values1)
         sigma = np.std(div_values1)
-        print(min(div_values1),max(div_values1))
+        print("min,max of div_values1 is", min(div_values1),max(div_values1))
         fig,ax=plt.subplots()
         n, bins, patches = ax.hist(div_values1,150,range=(3,130),density = True)
-        y = norm.pdf(bins, mu, 0.8*sigma)
+        y = norm.pdf(bins, mu, sigma)
         ax.plot(bins, y, 'r')
         plt.xlabel('Scale')
         plt.ylabel('Density')
-        plt.savefig(os.path.join(os.path.dirname(__file__), "hist_imgs2","{:010d}.jpg".format(i)))
+        plt.savefig(os.path.join(os.path.dirname(__file__), "hist_imgs_AirSim","{}.jpg".format(i)))
         plt.close()
         
-        #blend_img = blending_imgs(div_scale, color,i)
-        #blend_img.save(os.path.join(os.path.dirname(__file__), "blend_imgs","{:010d}.jpg".format(i)))
-        
-        
-        blending_imgs(surface_normal,color,i,'surface_normals')
-        blending_imgs(ground_mask,color,i,'ground_masks')
-        '''
-        blending_imgs(ground_mask,color,i,mask)
+        blending_imgs(div_scale, color, i, mask)
+
         pred_depth *= ratio
         ratios.append(ratio)
 
         pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
         pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
         #blending_imgs(div_scale, color,i,mask)
-
+        
         if len(gt_depth) != 0:
             errors.append(compute_errors(gt_depth, pred_depth))
-    '''
-    fl = open('ex.txt','w')
-    fl.writelines(str(ex_logs))
-    fl.close()
-    '''
-    np.save('mean_scale.npy', mean_scale)
-
+    ratios_dgc = np.array(ratios_dgc)
     ratios = np.array(ratios)
+    np.save('ideal_scale_AirSim.npy', ex_logs)
+    np.save('median_raitos_AirSim.npy', ratios)
+    np.save('dgc_raitos_AirSim.npy', ratios_dgc)
     med = np.median(ratios)
     print(" Scaling ratios | med: {:0.3f} | std: {:0.3f}".format(med, np.std(ratios / med)))
 

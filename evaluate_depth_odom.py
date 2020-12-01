@@ -147,13 +147,13 @@ def evaluate(opt):
 
         print("-> Loading weights from {}".format(opt.load_weights_folder))
 
-        filenames = readlines(os.path.join(splits_dir, opt.eval_split, "test_files.txt"))
+        filenames = readlines(os.path.join(splits_dir, "odom", "00.txt"))
         encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
         decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
 
         encoder_dict = torch.load(encoder_path)
 
-        dataset = datasets.KITTIRAWDataset(
+        dataset = datasets.KITTIOdomDataset(
             opt.data_path, filenames,
             encoder_dict['height'], encoder_dict['width'],
             [0], 4, is_train=False)
@@ -274,6 +274,7 @@ def evaluate(opt):
     for i in range(pred_disps.shape[0]):
         gt_depth = gt_depths[i]
         gt_height, gt_width = gt_depth.shape[:2]
+        '''
         line = filenames[i].split()
         folder = line[0]
         frame_index = line[1]
@@ -281,6 +282,7 @@ def evaluate(opt):
         color = pil_loader(get_image_path(folder,int(frame_index),side))
         #color = pil_loader('/mnt/sdb/xuefeng_data/dkit_dataset/20200629_mechanical_fast/images/{:006d}.png'.format(i))
         #color = color.crop((0,191,640,383))
+        '''
         
 
         pred_disp = pred_disps[i]
@@ -311,17 +313,17 @@ def evaluate(opt):
             scale_recovery = ScaleRecovery(1, gt_height, gt_width, K).cuda()
             #scale_recovery = ScaleRecovery(1, 192, 640, K).cuda()
             pred_depth = torch.from_numpy(pred_depth).unsqueeze(0).cuda()
-            ratio1,surface_normal1,ground_mask1,cam_points1 = scale_recovery(pred_depth)
-            #ratio = ratio1.cpu().item()
-            surface_normal = surface_normal1.cpu()[0,0,:,:].numpy()
-            ground_mask = ground_mask1.cpu()[0,0,:,:].numpy()fit.cpu().numpy()
+            ratio1,surface_normal1,ground_mask1,cam_points1,_,_,_ = scale_recovery(pred_depth)
+            ratio = ratio1.cpu().item()
+            #surface_normal = surface_normal1.cpu()[0,0,:,:].numpy()
+            #ground_mask = ground_mask1.cpu()[0,0,:,:].numpy()
             pred_depth = pred_depth[0].cpu().numpy()
-            cam_points=cam_points1.cpu().numpy()
-            cam_points_masked = cam_points[np.where(ground_mask==1)] 
-            print(cam_points_masked.shape)
-            plane,inliers = fit_plane_LSE_RANSAC(cam_points_masked.T)
-            print(plane)
-            ratio_rans = 1.65 / plane[-1]
+            #cam_points=cam_points1.cpu().numpy()
+            #cam_points_masked = cam_points[np.where(ground_mask==1)] 
+            #print(cam_points_masked.shape)
+            #plane,inliers = fit_plane_LSE_RANSAC(cam_points_masked.T)
+            #print(plane)
+            #ratio_rans = 1.65 / plane[-1]
         else:
             ratio = 1
         #print(ratio)
@@ -374,7 +376,7 @@ def evaluate(opt):
         blending_imgs(surface_normal,color,i,'surface_normals')
         blending_imgs(ground_mask,color,i,'ground_masks')
         '''
-        blending_imgs(ground_mask,color,i,mask)
+        #blending_imgs(ground_mask,color,i,mask)
         pred_depth *= ratio
         ratios.append(ratio)
 
@@ -392,6 +394,7 @@ def evaluate(opt):
     np.save('mean_scale.npy', mean_scale)
 
     ratios = np.array(ratios)
+    np.save('ratios_of_odom.npy',ratios)
     med = np.median(ratios)
     print(" Scaling ratios | med: {:0.3f} | std: {:0.3f}".format(med, np.std(ratios / med)))
 

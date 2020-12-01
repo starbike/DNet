@@ -98,7 +98,7 @@ def blending_imgs(ratio_tmp, input_img,i,mask):
     x,y = create_scatter_p(mask)
     ax.imshow(input_img)
     #ax.scatter(y,x,s=0.1,c=values,alpha=0.5,cmap='jet',vmin=-1,vmax=10)
-    ax.scatter(y,x,s=1,c='r',alpha=0.5)
+    ax.scatter(y,x,s=1,c='r',alpha=0.2)
     #plt.savefig(os.path.join(os.path.dirname(__file__), "blend_imgs","{:010d}.png".format(i)))
     plt.savefig(os.path.join(os.path.dirname(__file__), "ground_masks_kitti","{:010d}.png".format(i)))
     #ax.imshow(ratio_tmp,cmap='plasma')
@@ -109,6 +109,27 @@ def blending_imgs(ratio_tmp, input_img,i,mask):
     #img_blend.save(os.path.join(os.path.dirname(__file__), name,"{:006d}.png".format(i)))
     plt.close()
     #return img_blend
+
+def blending_imgs_inliers(u, v, uo, vo, input_img, i):
+    """visualizing ground points inliers after RANSAC
+    """
+    fig, ax = plt.subplots(1,dpi=300)
+    #height, width = input_img.size
+    width, height = input_img.size
+    ax.set_ylim(height, 0)
+    ax.set_xlim(0, width )
+    ax.axis('off')
+    fig.set_size_inches(width/100.0/3.0, height/100.0/3.0)
+    plt.gca().xaxis.set_major_locator(plt.NullLocator())
+    plt.gca().yaxis.set_major_locator(plt.NullLocator())
+    plt.subplots_adjust(top=1,bottom=0,left=0,right=1,hspace=0,wspace=0)
+    plt.margins(0,0)
+    ax.imshow(input_img)
+    ax.scatter(u,v,s=1,c='g',alpha=0.2)
+    ax.scatter(uo, vo, s=1, c='r',alpha=0.2)
+    plt.savefig(os.path.join(os.path.dirname(__file__), "ground_in_vs_outliers0.4z","{:010d}.png".format(i)))
+    plt.close()
+ 
 
 def tensor_to_PIL(tensor,idx):
     unloader = transforms.ToPILImage()
@@ -127,7 +148,7 @@ def get_image_path(folder, frame_index, side):
 def evaluate(opt):
     """Evaluates a pretrained model using a specified test set
     """
-    MN_DEPTHI = 1e-3
+    MIN_DEPTH = 1e-3
     MAX_DEPTH = 80
 
     K = np.array([[0.58, 0, 0.5, 0],
@@ -314,14 +335,36 @@ def evaluate(opt):
             ratio1,surface_normal1,ground_mask1,cam_points1 = scale_recovery(pred_depth)
             #ratio = ratio1.cpu().item()
             surface_normal = surface_normal1.cpu()[0,0,:,:].numpy()
-            ground_mask = ground_mask1.cpu()[0,0,:,:].numpy()fit.cpu().numpy()
+            ground_mask = ground_mask1.cpu()[0,0,:,:].numpy()
             pred_depth = pred_depth[0].cpu().numpy()
             cam_points=cam_points1.cpu().numpy()
-            cam_points_masked = cam_points[np.where(ground_mask==1)] 
-            print(cam_points_masked.shape)
-            plane,inliers = fit_plane_LSE_RANSAC(cam_points_masked.T)
-            print(plane)
-            ratio_rans = 1.65 / plane[-1]
+            cam_points2=cam_points.transpose(1,2,0)
+            print(np.sum(ground_mask))
+            zmax = np.max(cam_points2[:,:,2])
+            v,u = np.where((ground_mask==1)&(cam_points2[:,:,2]<0.5*zmax))
+            print(v.shape)
+            cam_points_masked = cam_points2[np.where((ground_mask==1)&(cam_points2[:,:,2]<0.4*zmax))]
+            cam_points_masked_num = np.concatenate((cam_points_masked,np.expand_dims(range(cam_points_masked.shape[0]),1)), axis=1)
+            np.random.shuffle(cam_points_masked_num) 
+            cam_points4 = np.array(cam_points_masked_num)
+            #print(cam_points4.shape)
+            cam_points4 = cam_points4[:opt.points_num,:]
+            cam_points_selected_index_in_gm = cam_points4[:,-1]
+            cam_points3 = np.concatenate((cam_points4[:,:-1], np.ones((cam_points4.shape[0], 1))), axis=1)
+            #print(cam_points3.shape)
+            #if i==28:
+            #    np.savetxt('groundpointsNx428.txt',cam_points4)
+            plane,inliers,outliers = fit_plane_LSE_RANSAC(cam_points3,opt.iters,opt.in_t,return_outlier_list=True)
+            cam_inliers = cam_points_selected_index_in_gm[inliers]
+            cam_outliers = cam_points_selected_index_in_gm[outliers]
+            #print(cam_inliers,type(cam_inliers))
+            u_inliers = u[cam_inliers.astype(int)]
+            v_inliers = v[cam_inliers.astype(int)]
+            u_outliers = u[cam_outliers.astype(int)]
+            v_outliers = v[cam_outliers.astype(int)]
+            blending_imgs_inliers(u_inliers,v_inliers,u_outliers,v_outliers,color,i)
+            #print(plane)
+            ratio_rans = abs(1.65 / plane[-1])
         else:
             ratio = 1
         #print(ratio)
@@ -333,7 +376,7 @@ def evaluate(opt):
         pred_depth_ori = np.where(mask==1,pred_depth_ori,1)
         pred_depth = pred_depth[mask]
         gt_depth = gt_depth[mask]
-        mean_scale.append(np.mean(gt_depth/pred_depth))
+        #mean_scale.append(np.mean(gt_depth/pred_depth))
 
         '''
         error_try = 100
@@ -374,9 +417,9 @@ def evaluate(opt):
         blending_imgs(surface_normal,color,i,'surface_normals')
         blending_imgs(ground_mask,color,i,'ground_masks')
         '''
-        blending_imgs(ground_mask,color,i,mask)
-        pred_depth *= ratio
-        ratios.append(ratio)
+        #blending_imgs(ground_mask,color,i,ground_mask)
+        pred_depth *= ratio_rans
+        ratios.append(ratio_rans)
 
         pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
         pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
@@ -389,14 +432,17 @@ def evaluate(opt):
     fl.writelines(str(ex_logs))
     fl.close()
     '''
-    np.save('mean_scale.npy', mean_scale)
+    #np.save('mean_scale.npy', mean_scale)
 
     ratios = np.array(ratios)
     med = np.median(ratios)
     print(" Scaling ratios | med: {:0.3f} | std: {:0.3f}".format(med, np.std(ratios / med)))
 
     mean_errors = np.array(errors).mean(0)
-
+    fl = open('{}x{}x{}.txt'.format(opt.points_num,opt.iters,opt.in_t),'w')
+    fl.writelines(str(("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\"))
+    fl.close()
+ 
     print("\n  " + ("{:>8} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
     print(("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\")
     

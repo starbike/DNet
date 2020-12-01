@@ -7,8 +7,9 @@ import numpy as np
 import torch
 from torchvision import transforms
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
-from layers import disp_to_depth, ScaleRecovery
+from layers_dp import disp_to_depth, ScaleRecovery, Project3D, BackprojectDepth, SSIM
 from utils import readlines
 from options import MonodepthOptions
 import datasets
@@ -18,8 +19,6 @@ import matplotlib.mlab as mlab
 import matplotlib.pyplot as plt 
 from math import sqrt
 from scipy.stats import norm
-
-from fit_plane_LSE import fit_plane_LSE_RANSAC
 
 cv2.setNumThreads(0)  # This speeds up evaluation 5x on our unix systems (OpenCV 3.3.1)
 
@@ -52,6 +51,101 @@ def compute_errors(gt, pred):
 
     return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
 
+def compute_grad(color):
+    """Computes gradient of an RGB image
+    """
+    gray = color.convert('L')
+    img = np.asarray(gray)
+    sobelx = cv2.Sobel(img, cv2.CV_64F,1,0,ksize=3)
+    sobelx = cv2.convertScaleAbs(sobelx)
+    sobely = cv2.Sobel(img, cv2.CV_64F,0,1,ksize=3)
+    sobely = cv2.convertScaleAbs(sobely)
+    sobelxy = cv2.addWeighted(sobelx, 0.5, sobely, 0.5, 0)
+    return sobelxy
+
+def selected_points(cords, input_img, i):
+    """visualize chosen low/high/median texture point
+    """
+    fig, ax = plt.subplots(1,dpi=300)
+    width, height = input_img.size
+    ax.set_ylim(height, 0)
+    ax.set_xlim(0, width )
+    ax.axis('off')
+    fig.set_size_inches(width/100.0/3.0, height/100.0/3.0)
+    plt.gca().xaxis.set_major_locator(plt.NullLocator())
+    plt.gca().yaxis.set_major_locator(plt.NullLocator())
+    plt.subplots_adjust(top=1,bottom=0,left=0,right=1,hspace=0,wspace=0)
+    plt.margins(0,0)
+    ax.imshow(input_img)
+    ax.scatter(cords[0][1], cords[0][0], s=1, c='g')
+    ax.scatter(cords[1][1], cords[1][0], s=1, c='r')
+    ax.scatter(cords[2][1], cords[2][0], s=1, c='b')
+    plt.savefig(os.path.join(os.path.dirname(__file__), "selected_points","{:06d}.png".format(i)))
+    plt.close()
+
+def visual_reprojection(input_img, cords, pixel_cords, i):
+    """Visualize reprojected pixel point with the minimum loss
+    """
+    fig, ax = plt.subplots(1,dpi=300)
+    width, height = input_img.size
+    ax.set_ylim(height, 0)
+    ax.set_xlim(0, width )
+    ax.axis('off')
+    fig.set_size_inches(width/100.0/3.0, height/100.0/3.0)
+    plt.gca().xaxis.set_major_locator(plt.NullLocator())
+    plt.gca().yaxis.set_major_locator(plt.NullLocator())
+    plt.subplots_adjust(top=1,bottom=0,left=0,right=1,hspace=0,wspace=0)
+    plt.margins(0,0)
+    ax.imshow(input_img)
+    ax.scatter(cords[1], cords[0], s=1, c='g')
+    ax.scatter(pixel_cords[1], pixel_cords[0], s=1, c='r')
+    plt.savefig(os.path.join(os.path.dirname(__file__), "reprojected_points","{:06d}.png".format(i)))
+    plt.close()
+
+def create_scatter(ratio_tmp,mask):
+    x,y = np.where(mask==1)
+    values = ratio_tmp[mask==1]
+    return x,y,values
+
+
+def find_cord(grad,mask):
+    """For pixels where LIDAR depth are available, find the low/high/median texture index
+    """
+    cords = []
+    ones = np.ones(grad.shape)
+    x_indices,y_indices,values = create_scatter(grad,mask)
+    print(values)
+    values_tens = torch.from_numpy(values)
+    _,min_ind = torch.min(values_tens,0)
+    _,max_ind = torch.max(values_tens,0)
+    _,median_ind = torch.median(values_tens,0)
+    x = x_indices[min_ind]
+    y = y_indices[min_ind]
+    cords.append([x,y])
+    x = x_indices[max_ind]
+    y = y_indices[max_ind]
+    cords.append([x,y])
+    x = x_indices[median_ind]
+    y = y_indices[median_ind]
+    cords.append([x,y])
+    cords_arr = np.array(cords)
+    print(cords_arr)
+
+    return cords_arr
+
+def compute_reprojection_loss(pred, target, cords):
+    """Computes reprojection loss between a batch of predicted and target images
+    """
+    ssim = SSIM()
+
+    l1_loss = torch.abs(target - pred).mean(1,True)
+    #print("l1_loss mean shape", l1_loss.shape)
+
+    ssim_loss = ssim(pred, target).mean(1,True)
+    #print("ssim_loss shape", ssim_loss.shape)
+    reprojection_loss = 0.85 * ssim_loss + 0.15 * l1_loss
+
+    return l1_loss[0,0,cords[0],cords[1]], ssim_loss[0,0,cords[0],cords[1]], reprojection_loss[0,0,cords[0],cords[1]]
 
 def batch_post_process_disparity(l_disp, r_disp):
     """Apply the disparity post-processing method as introduced in Monodepthv1
@@ -71,15 +165,6 @@ def pil_loader(path):
             return img.convert('RGB')
             #img1 = img.crop((0,191,640,383))
             #return img1
-def create_scatter(ratio_tmp,mask):
-    
-    x,y = np.where(mask==1)
-    values = ratio_tmp[mask==1]
-    return x,y,values
-
-def create_scatter_p(mask):
-    x,y = np.where(mask==1)
-    return x,y
 
 def blending_imgs(ratio_tmp, input_img,i,mask):
     """visualizing the factors affecting scale
@@ -94,13 +179,10 @@ def blending_imgs(ratio_tmp, input_img,i,mask):
     plt.gca().yaxis.set_major_locator(plt.NullLocator())
     plt.subplots_adjust(top=1,bottom=0,left=0,right=1,hspace=0,wspace=0)
     plt.margins(0,0)
-    #x,y,values = create_scatter(ratio_tmp,mask)
-    x,y = create_scatter_p(mask)
+    x,y,values = create_scatter(ratio_tmp,mask)
     ax.imshow(input_img)
-    #ax.scatter(y,x,s=0.1,c=values,alpha=0.5,cmap='jet',vmin=-1,vmax=10)
-    ax.scatter(y,x,s=1,c='r',alpha=0.5)
-    #plt.savefig(os.path.join(os.path.dirname(__file__), "blend_imgs","{:010d}.png".format(i)))
-    plt.savefig(os.path.join(os.path.dirname(__file__), "ground_masks_kitti","{:010d}.png".format(i)))
+    ax.scatter(y,x,s=0.1,c=values,alpha=0.5,cmap='jet',vmin=-1,vmax=10)
+    plt.savefig(os.path.join(os.path.dirname(__file__), "blend_imgs","{:010d}.png".format(i)))
     #ax.imshow(ratio_tmp,cmap='plasma')
     #plt.savefig('tmp.png')
     #img_tmp = pil_loader('tmp.png')
@@ -119,16 +201,20 @@ def tensor_to_PIL(tensor,idx):
     return image
 
 def get_image_path(folder, frame_index, side):
-        f_str = "{:010d}{}".format(frame_index, '.jpg')
-        image_path = os.path.join(
-            '/mnt/sdb/xuefeng_data/kitti_data', folder, "image_0{}/data".format(side), f_str)
-        return image_path
+    #side_map = {"2": 2, "3": 3, "l": 2, "r": 3}
+    f_str = "{:06d}{}".format(frame_index, '.png')
+    image_path = os.path.join(
+        '/mnt/sdb/kitti_odometry_dataset',
+        "sequences/{:02d}".format(int(folder)),
+        "image_2", f_str)
+    return image_path
 
 def evaluate(opt):
     """Evaluates a pretrained model using a specified test set
     """
-    MN_DEPTHI = 1e-3
+    MIN_DEPTH = 1e-3
     MAX_DEPTH = 80
+    selected_frame = 100
 
     K = np.array([[0.58, 0, 0.5, 0],
                   [0, 1.92, 0.5, 0],
@@ -147,16 +233,17 @@ def evaluate(opt):
 
         print("-> Loading weights from {}".format(opt.load_weights_folder))
 
-        filenames = readlines(os.path.join(splits_dir, opt.eval_split, "test_files.txt"))
+        sequence_id = 0
+        filenames = readlines(os.path.join(os.path.dirname(__file__), "splits", "odom",
+                     "test_files_{:02d}.txt".format(sequence_id)))
         encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
         decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
 
         encoder_dict = torch.load(encoder_path)
 
-        dataset = datasets.KITTIRAWDataset(
-            opt.data_path, filenames,
-            encoder_dict['height'], encoder_dict['width'],
-            [0], 4, is_train=False)
+        dataset = datasets.KITTIOdomDataset(
+            opt.data_path, filenames, opt.height, opt.width,
+            [0, 1], 4, is_train=False)
         dataloader = DataLoader(
             dataset, 16, shuffle=False, num_workers=opt.num_workers,
             pin_memory=True, drop_last=False)
@@ -251,8 +338,24 @@ def evaluate(opt):
         print("-> No ground truth is available for the KITTI benchmark, so not evaluating. Done.")
         quit()
 
-    gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
+    gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths_odom_00.npz")
     gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1', allow_pickle=True)["data"]
+    pred_poses = np.load('pred_poses_T.npy')
+    norms_divs = np.load('gt_norms_div00.npy')
+    scales_dgc = np.load('ratios_of_odom.npy')
+    '''
+    gt_poses_path = os.path.join(opt.data_path, "poses", "{:02d}.txt".format(sequence_id))
+    gt_global_poses = np.loadtxt(gt_poses_path).reshape(-1, 3, 4)
+    gt_global_poses = np.concatenate(
+        (gt_global_poses, np.zeros((gt_global_poses.shape[0], 1, 4))), 1)
+    gt_global_poses[:, 3, 3] = 1
+    gt_xyzs = gt_global_poses[:, :3, 3]
+
+    gt_local_poses = []
+    for i in range(1, len(gt_global_poses)):
+        gt_local_poses.append(
+            np.linalg.inv(np.dot(np.linalg.inv(gt_global_poses[i - 1]), gt_global_poses[i])))
+    '''
 
     print("-> Evaluating")
 
@@ -279,15 +382,13 @@ def evaluate(opt):
         frame_index = line[1]
         side = side_map[line[2]]
         color = pil_loader(get_image_path(folder,int(frame_index),side))
-        #color = pil_loader('/mnt/sdb/xuefeng_data/dkit_dataset/20200629_mechanical_fast/images/{:006d}.png'.format(i))
-        #color = color.crop((0,191,640,383))
-        
-
+        if i==selected_frame:
+            color_grad = compute_grad(color)     
+            color_next = pil_loader(get_image_path(folder,int(frame_index)+1,side))
         pred_disp = pred_disps[i]
         pred_disp = cv2.resize(pred_disp, (gt_width, gt_height))
         pred_depth = 1 / pred_disp
         
-
         if opt.eval_split == "eigen":
             mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
 
@@ -311,53 +412,71 @@ def evaluate(opt):
             scale_recovery = ScaleRecovery(1, gt_height, gt_width, K).cuda()
             #scale_recovery = ScaleRecovery(1, 192, 640, K).cuda()
             pred_depth = torch.from_numpy(pred_depth).unsqueeze(0).cuda()
-            ratio1,surface_normal1,ground_mask1,cam_points1 = scale_recovery(pred_depth)
-            #ratio = ratio1.cpu().item()
-            surface_normal = surface_normal1.cpu()[0,0,:,:].numpy()
-            ground_mask = ground_mask1.cpu()[0,0,:,:].numpy()fit.cpu().numpy()
+            ratio1,surface_normal1,ground_mask1,_,_,_,_ = scale_recovery(pred_depth)
+            ratio = ratio1.cpu().item()
+            
+            surface_normal = surface_normal1.cpu()[0,:,:,:].numpy()
+            ground_mask = ground_mask1.cpu()[0,0,:,:].numpy()
             pred_depth = pred_depth[0].cpu().numpy()
-            cam_points=cam_points1.cpu().numpy()
-            cam_points_masked = cam_points[np.where(ground_mask==1)] 
-            print(cam_points_masked.shape)
-            plane,inliers = fit_plane_LSE_RANSAC(cam_points_masked.T)
-            print(plane)
-            ratio_rans = 1.65 / plane[-1]
         else:
             ratio = 1
         #print(ratio)
         #print(max(pred_depth))
         #print(min(pred_depth))
-        
+        if i==selected_frame:
+            cords = find_cord(color_grad, mask)
+            selected_points(cords, color, i)
+            min_gt = gt_depth[cords[0][0]][cords[0][1]]
+            max_gt = gt_depth[cords[1][0]][cords[1][1]]
+            median_gt = gt_depth[cords[2][0]][cords[2][1]]
+            print("min max median gt depths are", min_gt, max_gt, median_gt)
+
+            to_tensor = transforms.ToTensor()
+            color_tens = to_tensor(color)
+            color_tens_next = to_tensor(color_next).unsqueeze(0)
+            pred_pose = pred_poses[i]
+            norms_div = norms_divs[i]
+            scale_dgc = scales_dgc[i]
+            pred_pose_tens = torch.from_numpy(pred_pose).unsqueeze(0).cuda()
+            t_norm = np.linalg.norm(pred_pose[:3, 3])
+            print("gt_depth of min max median divided by norms of translation and scale of norm", min_gt/(t_norm*norms_div), max_gt/(t_norm*norms_div), median_gt/(t_norm*norms_div))
+            print("gt_depth of min max median divided by norms of translation and scale of dgc", min_gt/(t_norm*scale_dgc), max_gt/(t_norm*scale_dgc), median_gt/(t_norm*scale_dgc))
+
+            depth_tens = torch.from_numpy(pred_depth).unsqueeze(0).cuda()
+            project_3d = Project3D(1, gt_height, gt_width).cuda()
+            backproject_depth = BackprojectDepth(1, gt_height, gt_width).cuda()
+            K_tens = torch.from_numpy(K).unsqueeze(0).cuda()
+            inv_K = np.linalg.pinv(K)
+            inv_K = torch.from_numpy(inv_K).unsqueeze(0).cuda()
+            cam_points = backproject_depth(depth_tens, inv_K,torch.from_numpy(cords[2]).cuda())
+            pix_coords = np.array(project_3d(cam_points, K_tens, pred_pose_tens))	
+            #print(pix_coords.shape)
+            #pix_coords = pix_coords[0,:,:,:]
+            l1_losses = []
+            ssim_losses = []
+            reprojection_losses = []
+             
+            for pix_coord in pix_coords:
+                pix_coord_tens = torch.from_numpy(pix_coord).unsqueeze(0)
+                pred = F.grid_sample(color_tens_next, pix_coord_tens, padding_mode="border")
+                l1_loss, ssim_loss, reprojection_loss = compute_reprojection_loss(pred, color_tens.unsqueeze(0),cords[2])
+                l1_losses.append(l1_loss)
+                ssim_losses.append(ssim_loss)
+                reprojection_losses.append(reprojection_loss)
+            min_loss_pixel_index = np.argmin(reprojection_losses)
+            visual_reprojection(color,cords[2],pix_coords[min_loss_pixel_index,cords[2,0],cords[2,1]],selected_frame)
+
         pred_depth_ori = pred_depth*mask
         gt_depth_ori = gt_depth*mask
         pred_depth_ori = np.where(mask==1,pred_depth_ori,1)
         pred_depth = pred_depth[mask]
         gt_depth = gt_depth[mask]
         mean_scale.append(np.mean(gt_depth/pred_depth))
-
+        
         '''
-        error_try = 100
-        scale_abs = 0 
-        for ratio_try in np.arange(0.1,50,step=0.1):
-            pred_depth1=pred_depth * ratio_try
-            error_tmp = compute_errors(gt_depth, pred_depth1)[0]
-            #print(error_tmp)
-            if error_tmp < error_try:
-                error_try = error_tmp
-                scale_abs = ratio_try
-        div_scale = gt_depth_ori / pred_depth_ori
-        #print(div_scale.shape)
-        div_values1 = div_scale[mask]
-        div_scale = (div_scale-scale_abs)/scale_abs
-        div_values = div_scale[mask]
-        div_rmse = sqrt(sum((div_values1-scale_abs)*(div_values1-scale_abs))/len(div_values1))
-        print(min(div_values),max(div_values))
-        ex_logs.append([i,min(div_values), max(div_values), div_rmse,scale_abs])
-        #print(div_scale.shape)
-        #div_scale = div_scale/np.max(div_scale)
         mu = np.mean(div_values1)
         sigma = np.std(div_values1)
-        print(min(div_values1),max(div_values1))
+        #print(min(div_values1),max(div_values1))
         fig,ax=plt.subplots()
         n, bins, patches = ax.hist(div_values1,150,range=(3,130),density = True)
         y = norm.pdf(bins, mu, 0.8*sigma)
@@ -374,7 +493,6 @@ def evaluate(opt):
         blending_imgs(surface_normal,color,i,'surface_normals')
         blending_imgs(ground_mask,color,i,'ground_masks')
         '''
-        blending_imgs(ground_mask,color,i,mask)
         pred_depth *= ratio
         ratios.append(ratio)
 
@@ -384,13 +502,12 @@ def evaluate(opt):
 
         if len(gt_depth) != 0:
             errors.append(compute_errors(gt_depth, pred_depth))
-    '''
-    fl = open('ex.txt','w')
-    fl.writelines(str(ex_logs))
-    fl.close()
-    '''
-    np.save('mean_scale.npy', mean_scale)
-
+    save_path = os.path.join(os.path.dirname(__file__), "l1_losses_{}.npy".format(selected_frame))
+    np.save(save_path, l1_losses)
+    save_path = os.path.join(os.path.dirname(__file__), "ssim_losses_{}.npy".format(selected_frame))
+    np.save(save_path, ssim_losses)
+    save_path = os.path.join(os.path.dirname(__file__), "reprojection_losses_{}.npy".format(selected_frame))
+    np.save(save_path, reprojection_losses)
     ratios = np.array(ratios)
     med = np.median(ratios)
     print(" Scaling ratios | med: {:0.3f} | std: {:0.3f}".format(med, np.std(ratios / med)))

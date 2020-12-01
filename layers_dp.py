@@ -163,13 +163,21 @@ class BackprojectDepth(nn.Module):
         self.pix_coords = nn.Parameter(
             torch.cat([self.pix_coords, self.ones], 1), requires_grad=False)
 
-    def forward(self, depth, inv_K):
-        cam_points = torch.matmul(inv_K[:, :3, :3], self.pix_coords)
-        cam_points = depth.view(self.batch_size, 1, -1) * cam_points
-        cam_points = torch.cat([cam_points, self.ones], 1).reshape(
-            self.batch_size, 4, self.height, self.width)
+    def forward(self, depth, inv_K, cord):
+        cam_pointss = []
+        for i in np.arange(13,34,step=0.05):
+            depth[0,cord[0],cord[1]] = i
+            cam_points = torch.matmul(inv_K[:, :3, :3], self.pix_coords)
+            #print("shape of depth is ",depth.shape)
+            #print("shape of cam_points is", cam_points.shape)
+            cam_points = depth.view(self.batch_size, 1, -1) * cam_points
+            cam_points = torch.cat([cam_points, self.ones], 1).reshape(
+                self.batch_size, 4, self.height, self.width)
+            cam_pointss.append(cam_points)
+        #cam_pointss_tens = torch.from_numpy(cam_pointss).cuda()
+        #print(type(cam_pointss))
 
-        return cam_points
+        return cam_pointss
 
 
 class Project3D(nn.Module):
@@ -183,19 +191,25 @@ class Project3D(nn.Module):
         self.width = width
         self.eps = eps
 
-    def forward(self, points, K, T):
+    def forward(self, pointss, K, T):
         P = torch.matmul(K, T)[:, :3, :]
 
-        points = points.view(self.batch_size, 4, -1)
-        cam_points = torch.matmul(P, points)
+        pix_coordss = []
+        for points in pointss:
 
-        pix_coords = cam_points[:, :2, :] / (cam_points[:, 2, :].unsqueeze(1) + self.eps)
-        pix_coords = pix_coords.view(self.batch_size, 2, self.height, self.width)
-        pix_coords = pix_coords.permute(0, 2, 3, 1)
-        pix_coords[..., 0] /= self.width - 1
-        pix_coords[..., 1] /= self.height - 1
-        pix_coords = (pix_coords - 0.5) * 2
-        return pix_coords
+            points = points.view(self.batch_size, 4, -1)
+            cam_points = torch.matmul(P, points)
+            #print("cam_points in project 3d for is", cam_points.shape)
+            pix_coords = cam_points[:, :2, :] / (cam_points[:, 2, :].unsqueeze(1) + self.eps)
+            pix_coords = pix_coords.view(self.batch_size, 2, self.height, self.width)
+            pix_coords = pix_coords.permute(0, 2, 3, 1)
+            pix_coords[..., 0] /= self.width - 1
+            pix_coords[..., 1] /= self.height - 1
+            pix_coords = (pix_coords - 0.5) * 2
+            pix_coordss.append(pix_coords.cpu())
+        pix_coordss = np.concatenate(pix_coordss)
+        #print("shape of pix_coords in project 3d for is",pix_coordss.shape)
+        return pix_coordss
 
 
 def upsample(x, sf=2):

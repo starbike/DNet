@@ -12,14 +12,15 @@ import argparse
 import numpy as np
 import PIL.Image as pil
 
+from AirSim_utils import read_pfm
 from utils import readlines
 from kitti_utils import generate_depth_map
 
 
 def export_gt_depths_kitti():
     parser = argparse.ArgumentParser(description='export_gt_depth')
-add_argument('--data_pat
-    parser.h',
+
+    parser.add_argument('--data_path',
                         type=str,
                         help='path to the root of the KITTI data',
                         required=True)
@@ -27,11 +28,19 @@ add_argument('--data_pat
                         type=str,
                         help='which split to export gt from',
                         required=True,
-                        choices=["eigen", "eigen_benchmark"])
+                        choices=["eigen", "eigen_benchmark","odom", "AirSim"])
+    parser.add_argument('--sequence',
+                        type=int,
+                        help='which odom sequnce to export gt from',
+                        required=False,
+                        default=0)
     opt = parser.parse_args()
 
     split_folder = os.path.join(os.path.dirname(__file__), "splits", opt.split)
-    lines = readlines(os.path.join(split_folder, "test_files.txt"))
+    if opt.split == "odom":
+        lines = readlines(os.path.join(split_folder,"{:02d}_exp.txt".format(opt.sequence)))
+    else:
+        lines = readlines(os.path.join(split_folder, "test_files.txt"))
 
     print("Exporting ground truth depths for {}".format(opt.split))
 
@@ -40,7 +49,7 @@ add_argument('--data_pat
         folder, frame_id, _ = line.split()
         frame_id = int(frame_id)
 
-        if opt.split == "eigen":
+        if (opt.split == "eigen")|(opt.split == "odom"):
             calib_dir = os.path.join(opt.data_path, folder.split("/")[0])
             velo_filename = os.path.join(
                 opt.data_path, folder,
@@ -51,6 +60,10 @@ add_argument('--data_pat
                 opt.data_path, folder, "proj_depth",
                 "groundtruth", "image_02", "{:010d}.png".format(frame_id))
             gt_depth = np.array(pil.open(gt_depth_path)).astype(np.float32) / 256
+        elif opt.split == "AirSim"
+            gt_depth_path = os.path.join(
+                opt.data_path, folder, "{}.pfm".format(frame_id))
+            gt_depth,_ = read_pfm(gt_depth_path)
 
         gt_depths.append(gt_depth.astype(np.float32))
 
